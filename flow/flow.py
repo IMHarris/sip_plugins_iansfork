@@ -14,20 +14,49 @@ import io
 import queue
 import json  # for working with data file
 from sip import template_render  #  Needed for working with web.py templates
-from smbus import SMBus
 import threading
 import time
 from urls import urls  # Get access to SIP's URLs
 import web  # web.py framework
 from webpages import ProtectedPage, WebPage  # Needed for security
 from webpages import showInFooter  # Enable plugin to display station data on timeline
-# from webpages import showOnTimeline  # Enable plugin to display station data on timeline
+
+# ========================================
+# FLOW SENSOR CONFIGURATION
+# ========================================
+# Set to True for ESP32C3 (UART), False for Arduino (I2C)
+USE_UART_MODE = True
+
+# UART Configuration (for ESP32C3)
+UART_PORT = "/dev/ttyAMA0"  # Default UART on Pi. Alternative: "/dev/serial0"
+UART_BAUD = 115200
+
+# I2C Configuration (for Arduino)
+I2C_CLIENT_ADDR = 0x44
+
+# ========================================
+# Mode-specific imports
+# ========================================
+if USE_UART_MODE:
+    try:
+        import serial
+    except ImportError:
+        print(u"ERROR: pyserial not found.")
+        print(u"Please install: sudo apt install python3-serial")
+        sys.exit(1)
+
+    comm_interface = None  # Will be initialized in main_loop
+else:
+    try:
+        from smbus2 import SMBus, i2c_msg
+        bus = SMBus(1)
+    except ImportError:
+        print(u"ERROR: smbus2 not found.")
+        print(u"Please install: sudo apt install python3-smbus2")
+        sys.exit(1)
 
 # Global variables
-SENSOR_REGISTER = 0x00  # 0x00 to receive sensor readings, 0x01 to have the sensor send random numbers to use for testing
-# Number of readings to average for the flow rate reading display passed to flow smoother.
-# This is for display purposes only and does not change the usage
-# calculation in any way
+SENSOR_REGISTER = 0x00  # Legacy - kept for compatibility
 plugin_initiated = False
 fs = flowhelpers.FlowSmoother(5)
 settings_b4 = {}
@@ -37,10 +66,10 @@ master_sensor_addr = 0
 pulse_rate = 0  # holds last captured flow rate
 flow_loop_running = False  # Notes if the main loop has started
 valve_loop_running = False  # Notes if the valve loop has started
-# valve_open = False  # Shows as true if any valve is open
 ls = flowhelpers.LocalSettings()
 fw = flowhelpers.FlowWindow(ls)
 valve_messages = queue.Queue()  # Carries messages from notify_zone_change to the changed_valves_loop
+
 # Variables to note if notification plugins are loaded
 email_loaded = False
 sms_loaded = False
@@ -48,11 +77,8 @@ sms_plugin = ""
 voice_loaded = False
 voice_plugin = ""
 
-# Variables for the flow controller client
-CLIENT_ADDR = 0x44
-bus = SMBus(1)
-
-# Initiate notifications object
+# Legacy variable for backwards compatibility
+CLIENT_ADDR = I2C_CLIENT_ADDR
 
 # Add new URLs to access classes in this plugin.
 # fmt: off
@@ -91,8 +117,135 @@ def print_settings(lpad=2):
     """
     Prints the flow settings
     """
-    print(u"{}Master flow sensor address: {}".format(" " * lpad, u"0x%02X" % CLIENT_ADDR))
-   
+    if USE_UART_MODE:
+        print(u"{}Flow sensor mode: UART".format(" " * lpad))
+        print(u"{}UART port: {} at {} baud".format(" " * lpad, UART_PORT, UART_BAUD))
+    else:
+        print(u"{}Flow sensor mode: I2C".format(" " * lpad))
+        print(u"{}I2C address: {}".format(" " * lpad, u"0x%02X" % I2C_CLIENT_ADDR))
+
+
+def set_operation_mode(mode):
+    """
+    Sets the operation mode on the flow sensor controller
+
+    Args:
+        mode: 0x00 for production mode (read real sensor), 0x01 for test mode (generate random data)
+
+    Returns:
+        True if successful, False otherwise
+    """
+    global comm_interface
+
+    if not USE_UART_MODE:
+        print(u"ERROR: set_operation_mode() only works in UART mode (ESP32C3)")
+        return False
+
+    if comm_interface is None or not comm_interface.is_open:
+        print(u"ERROR: UART port is not open")
+        return False
+
+    try:
+        # Clear any stale data
+        comm_interface.reset_input_buffer()
+
+        # Send mode change command: 'M' + mode_byte
+        comm_interface.write(b'M')
+        comm_interface.write(bytes([mode]))
+
+        # Wait for acknowledgment
+        time.sleep(0.1)
+        ack = comm_interface.read(1)
+
+        if len(ack) == 1 and ack[0] == ord('A'):
+            mode_str = "production" if mode == 0x00 else "test"
+            print(u"Operation mode changed to: {} (0x{:02X})".format(mode_str, mode))
+            return True
+        else:
+            print(u"ERROR: Failed to receive acknowledgment from controller")
+            return False
+
+    except Exception as e:
+        print(u"ERROR: Failed to set operation mode: {}".format(e))
+        return False
+
+
+def list_available_uart_ports():
+    """
+    List all available serial ports on the system
+
+    Returns:
+        List of available port device paths
+    """
+    try:
+        from serial.tools import list_ports
+        ports = list_ports.comports()
+        print(u"Available serial ports:")
+        available = []
+        for port in ports:
+            print(u"  {} - {}".format(port.device, port.description))
+            available.append(port.device)
+        return available
+    except Exception as e:
+        print(u"ERROR: Failed to list serial ports: {}".format(e))
+        return []
+
+
+def find_uart_port():
+    """
+    Auto-detect the UART port for Raspberry Pi or other systems
+    Tries common ports and returns the first available one
+
+    Returns:
+        Port path string if found, None otherwise
+    """
+    import os
+
+    # Common UART ports on Raspberry Pi and other systems
+    possible_ports = [
+        "/dev/ttyAMA0",    # Pi 3/4/5 (when Bluetooth disabled)
+        "/dev/serial0",    # Symlink to primary UART
+        "/dev/ttyS0",      # Pi 3/4 (when Bluetooth enabled)
+        "/dev/ttyUSB0",    # USB-to-serial adapter
+        "/dev/ttyACM0",    # Some USB devices (like ESP32C3 USB-CDC)
+    ]
+
+    print(u"Auto-detecting UART port...")
+
+    for port in possible_ports:
+        if os.path.exists(port):
+            try:
+                # Try to open the port briefly to verify it works
+                test = serial.Serial(port, UART_BAUD, timeout=0.1)
+                test.close()
+                print(u"  Found working UART port: {}".format(port))
+                return port
+            except Exception as e:
+                print(u"  Port {} exists but failed to open: {}".format(port, e))
+                continue
+        else:
+            print(u"  Port {} does not exist".format(port))
+
+    # If no standard ports found, try listing all available ports
+    print(u"  No standard ports found. Checking all available ports...")
+    available = list_available_uart_ports()
+    if available:
+        # Try the first available port
+        try:
+            test = serial.Serial(available[0], UART_BAUD, timeout=0.1)
+            test.close()
+            print(u"  Using first available port: {}".format(available[0]))
+            return available[0]
+        except:
+            pass
+
+    print(u"  ERROR: No working UART port found!")
+    print(u"  Please check:")
+    print(u"    1. Hardware is connected")
+    print(u"    2. Serial console is disabled (raspi-config)")
+    print(u"    3. User has permission to access serial ports (add to 'dialout' group)")
+    return None
+
 
 def changed_valves_loop():
     """
@@ -105,13 +258,13 @@ def changed_valves_loop():
 
     valve_loop_running = True
     while True:
-        
+
         while not valve_messages.empty():
             # sleep here to ensure that if multiple valves are closed at the same time,
             # the main program has time to update all the valves in gv.sd
             time.sleep(0.25)
             valve_notice = valve_messages.get()
-            if str(gv.srvals) != str(fw.valve_states()):               
+            if str(gv.srvals) != str(fw.valve_states()):
                 capture_time = valve_notice.switch_time
                 capture_flow_counter = valve_notice.counter
                 i = 0
@@ -134,11 +287,11 @@ def changed_valves_loop():
                     fw.end_pulses = capture_flow_counter
                     fw.end_time = capture_time
                     fw.write_log()
-            
+
                 elif not fw.valve_open() and fw_new.valve_open():
                     # Flow has started.  New flow window has already been created above
                     pass
-            
+
                 elif fw.valve_open() and fw_new.valve_open():
                     # Flow is still running but through different valve(s)
                     # End current flow window
@@ -146,7 +299,7 @@ def changed_valves_loop():
                     fw.end_time = capture_time
                     fw.write_log()
                 fw = fw_new
-        
+
         time.sleep(0.25)
 
 class clear_log(ProtectedPage):
@@ -181,7 +334,7 @@ class download_csv(ProtectedPage):
                 + u'", '
                 + str(event[u"usage"])
                 + u', '
-                + event[u"measure"] 
+                + event[u"measure"]
                 + u'\n'
             )
 
@@ -192,13 +345,22 @@ class download_csv(ProtectedPage):
 class settings(ProtectedPage):
     """
     Load an html page for entering plugin settings.
-    """ 
-    # global master_sensor_addr
-    # settings_b4 = {}
+    """
     def GET(self):
-        
+
         try:
-            runtime_values = {"sensor-addr": u"0x%02X" % CLIENT_ADDR}
+            # Update runtime values based on mode
+            if USE_UART_MODE:
+                runtime_values = {
+                    "sensor-mode": "UART",
+                    "sensor-addr": UART_PORT
+                }
+            else:
+                runtime_values = {
+                    "sensor-mode": "I2C",
+                    "sensor-addr": u"0x%02X" % I2C_CLIENT_ADDR
+                }
+
             if pulse_rate >=0:
                 runtime_values.update({"sensor-connected": "yes"})
             else:
@@ -264,7 +426,6 @@ class download_flowrate_csv(ProtectedPage):
         data = _(u"Station, Rate, Units, Recorded") + u"\n"
         for (k, v) in x.items():
             flow_rate = round(v["rate"] * 3600 / ls.pulses_per_measure, 1)
-            # flow_rate_str = "{:,.1f} {}/hr".format(flow_rate, ls.volume_measure)
             data += (
                 '"'
                 + gv.snames[int(k)]
@@ -323,14 +484,14 @@ class save_settings(ProtectedPage):
         ls.load_settings()
 
         raise web.seeother(u"/")  # Return user to home page.
- 
-   
+
+
 class flowdata(ProtectedPage):
     """
     Return flow values to the web page in JSON form
     """
     global pulse_rate
-    
+
     def GET(self):
         web.header(b"Access-Control-Allow-Origin", b"*")
         web.header(b"Content-Type", b"application/json")
@@ -350,7 +511,7 @@ class flowdata(ProtectedPage):
             qdict.update({u"flow_rate": 0})
             qdict.update({u"flow_rate_raw": 0})
         qdict.update({u"volume_measure": ls.volume_measure + "/hr"})
-        
+
         # Water usage since beginning of window
         if ls.pulses_per_measure > 0:
             water_use = round((all_pulses - fw.start_pulses) / ls.pulses_per_measure, 1)
@@ -358,10 +519,10 @@ class flowdata(ProtectedPage):
             water_use = 0
         water_use_str = str(water_use) + " " + ls.volume_measure
         qdict.update({u"water_use": water_use_str})
-        
+
         # Create valve status string
         qdict.update({u"valve_status": fw.valves_status_str()})
-        
+
         return json.dumps(qdict)
 
 
@@ -370,7 +531,11 @@ class flow(ProtectedPage):
 
     def GET(self):
         try:
-            runtime_values = {"sensor-addr": u"0x%02X" % CLIENT_ADDR}
+            if USE_UART_MODE:
+                runtime_values = {"sensor-addr": UART_PORT}
+            else:
+                runtime_values = {"sensor-addr": u"0x%02X" % I2C_CLIENT_ADDR}
+
             if pulse_rate >= 0:
                 runtime_values.update({"sensor-connected": "yes"})
             else:
@@ -382,7 +547,6 @@ class flow(ProtectedPage):
                 settings = json.load(f)
         except IOError:  # If file does not exist return empty value
             settings = {}
-            # Default settings. can be list, dictionary, etc.
 
         records = flowhelpers.read_log()
         return template_render.flow(settings, runtime_values, records)
@@ -411,19 +575,93 @@ def main_loop():
     global pulse_rate
     global all_pulses
     global fw
+    global comm_interface
+
     flow_loop_running = True
     print(u"Flow plugin main loop initiated.")
+
+    # Initialize communication interface
+    if USE_UART_MODE:
+        # Configure GPIO pins 14 and 15 for UART (ALT0 function)
+        # This is necessary because SIP may reset pins during startup
+        try:
+            import subprocess
+            subprocess.run(['pinctrl', 'set', '14', 'a0'], check=True)
+            subprocess.run(['pinctrl', 'set', '15', 'a0'], check=True)
+            print(u"GPIO pins 14 and 15 configured for UART (ALT0)")
+        except Exception as e:
+            print(u"WARNING: Failed to configure GPIO pins for UART: {}".format(e))
+            print(u"You may need to manually run: sudo pinctrl set 14 a0; sudo pinctrl set 15 a0")
+
+        # Try to open the configured port first
+        port_to_use = UART_PORT
+        try:
+            comm_interface = serial.Serial(port_to_use, UART_BAUD, timeout=1)
+            print(u"UART initialized: {} at {} baud".format(port_to_use, UART_BAUD))
+        except Exception as e:
+            print(u"WARNING: Failed to open configured UART port {}: {}".format(port_to_use, e))
+            print(u"Attempting auto-detection...")
+
+            # Try auto-detection
+            detected_port = find_uart_port()
+            if detected_port:
+                try:
+                    comm_interface = serial.Serial(detected_port, UART_BAUD, timeout=1)
+                    print(u"UART initialized on auto-detected port: {} at {} baud".format(detected_port, UART_BAUD))
+                    port_to_use = detected_port
+                except Exception as e2:
+                    print(u"ERROR: Failed to open auto-detected port {}: {}".format(detected_port, e2))
+                    comm_interface = None
+            else:
+                print(u"ERROR: No working UART port found")
+                comm_interface = None
+    else:
+        print(u"I2C initialized at address 0x{:02X}".format(I2C_CLIENT_ADDR))
+
     start_time = datetime.datetime.now()
 
     while True:
         try:
-            bytes = bus.read_i2c_block_data(CLIENT_ADDR, SENSOR_REGISTER, 4)
-            pulse_rate = int.from_bytes(bytes, u"little")
+            if USE_UART_MODE:
+                # ========================================
+                # UART MODE (ESP32C3)
+                # ========================================
+                if comm_interface and comm_interface.is_open:
+                    # Clear any stale data
+                    comm_interface.reset_input_buffer()
+
+                    # Send read command
+                    comm_interface.write(b'R')
+
+                    # Wait for response (4 bytes)
+                    time.sleep(0.02)  # 20ms delay for ESP32C3 to respond
+                    data = comm_interface.read(4)
+
+                    if len(data) == 4:
+                        pulse_rate = int.from_bytes(data, "little")
+                    else:
+                        pulse_rate = -1
+                else:
+                    pulse_rate = -1
+
+            else:
+                # ========================================
+                # I2C MODE (Arduino)
+                # ========================================
+                msg = i2c_msg.read(I2C_CLIENT_ADDR, 4)
+                bus.i2c_rdwr(msg)
+                data = list(msg)
+                pulse_rate = int.from_bytes(data, "little")
+
             fs.add_reading(pulse_rate)
             fw.set_pulse_values(pulse_rate, all_pulses)
-            # fw.pulse_rate = pulse_rate
 
-        except IOError:
+        except IOError as e:
+            print(u"Communication error: {}".format(e))
+            pulse_rate = -1
+            fs.add_reading(pulse_rate)
+        except Exception as e:
+            print(u"Error: {}".format(e))
             pulse_rate = -1
             fs.add_reading(pulse_rate)
 
@@ -431,6 +669,13 @@ def main_loop():
             stop_time = datetime.datetime.now()
             time_elapsed = stop_time - start_time
             all_pulses = all_pulses + time_elapsed.total_seconds() * pulse_rate
+            print("*****")
+            print("All Pulses", all_pulses)
+            print("Start Time", start_time)
+            print("Stop Time", stop_time)
+            print("Time elapsed/seconds", time_elapsed.total_seconds())
+            print("Pulse Rate", pulse_rate)
+            print("*****")
             start_time = stop_time
 
         # Update the application footer with flow information
@@ -453,7 +698,7 @@ def main_loop():
 flow_loop = LoopThread(main_loop, 1, "FlowLoop", 1)
 valve_loop = LoopThread(changed_valves_loop, 2, "ValveLoop", 2)
 
-    
+
 """
 Event Triggers
 """
